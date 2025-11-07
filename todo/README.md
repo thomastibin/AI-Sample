@@ -29,7 +29,7 @@ Start the LLM server:
 - `python .\llm_server\main.py` error use below
 - `python -m llm_server.main`
 - or `uvicorn llm_server.main:app --port 8001 --reload`
-
+ - `python -m mcpserver.server`
 **Test from Postman**
 - POST `http://localhost:8001/chat`
 - Body:

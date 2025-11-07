@@ -1,0 +1,17 @@
+# General
+DEFAULT_TZ=Asia/Kolkata
+PORT_MCP=8000
+PORT_LLM=8001
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=meet_todo
+
+# Google OAuth (create via Google Cloud Console: OAuth 2.0 Desktop or Web app)
+GOOGLE_CLIENT_ID= 
+GOOGLE_CLIENT_SECRET= 
+GOOGLE_CALENDAR_ID=primary
+GOOGLE_TOKEN_PATH=.tokens/google_token.json
+
+# Gemini API
+GEMINI_API_KEY= 
+MCP_HTTP_BASE = "http://127.0.0.1:8000"
+

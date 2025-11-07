@@ -99,3 +99,6 @@ mount_mcp_streamable_http failed during __main__ mount
 [HTTP] /calendar/schedule created id: a6er345rg17c0cb3g59cd0ru8o
 [HTTP] /calendar/schedule payload: {'title': 'Project sync', 'start': '2025-11-08T18:30:00+05:30', 'end': '2025-11-08T19:00:00+05:30', 'attendees': ['thomastibin@gmail.com'], 'description': 'Agenda ...', 'tz': 'Asia/Kolkata'}
 [HTTP] /calendar/schedule created id: m1dtae5amgu2rr3792ninom8t4
+[MCP] Streamable HTTP mount skipped: AttributeError("'StreamableHTTPServerTransport' object has no attribute 'handle_post_message'")
+[MCP] Streamable HTTP mount skipped: AttributeError("'StreamableHTTPServerTransport' object has no attribute 'handle_post_message'")
+[STARTUP] ensure_indexes() OK
