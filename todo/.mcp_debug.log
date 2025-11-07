@@ -1,0 +1,101 @@
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[MONGO] ensuring todos indexes
+[STDIO] starting _run_stdio()
+[MONGO] ensuring todos indexes
+[STDIO] ensure_indexes() done
+[STDIO] stdio_server crashed: ExceptionGroup('unhandled errors in a TaskGroup', [AttributeError("module 'anyio.lowlevel' has no attribute 'sleep_forever'"), TypeError("'async for' requires an object with __aiter__ method, got Server")])
+[STDIO] stdio_server exited
+[STDIO] starting _run_stdio()
+[MONGO] ensuring todos indexes
+[STDIO] ensure_indexes() done
+[STDIO] stdio_server crashed: ExceptionGroup('unhandled errors in a TaskGroup', [TypeError("'async for' requires an object with __aiter__ method, got Server")])
+[STDIO] stdio_server exited
+[STDIO] starting _run_stdio()
+[MONGO] ensuring todos indexes
+[STDIO] ensure_indexes() done
+[STDIO] stdio_server crashed: ExceptionGroup('unhandled errors in a TaskGroup', [TypeError("'async for' requires an object with __aiter__ method, got Server")])
+[STDIO] stdio_server exited
+[STDIO] starting _run_stdio()
+[MONGO] ensuring todos indexes
+[STDIO] ensure_indexes() done
+[STDIO] using NEW mcp stdio_server(app) API
+[STDIO] server.serve() (new API)
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[HTTP] /todo/search payload: {'dateFrom': '2025-06-10T18:30:00Z', 'dateTo': '2025-11-10T19:00:00Z'}
+[HTTP] /todo/search returning count: 4
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[HTTP] /calendar/schedule payload: {'title': 'Project sync', 'start': '2025-11-06T18:30:00+05:30', 'end': '2025-11-06T19:00:00+05:30', 'attendees': ['thomastibin@gmail.com'], 'description': 'Agenda ...', 'tz': 'Asia/Kolkata'}
+[HTTP] /calendar/schedule created id: i4506s05a7uahscdl445923kn8
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+mount_mcp_streamable_http failed during __main__ mount
+[STARTUP] ensure_indexes() OK
+mount_mcp_streamable_http failed during __main__ mount
+[STARTUP] ensure_indexes() OK
+[MODULE] mount_mcp_streamable_http FAILED: TypeError("StreamableHTTPServerTransport.__init__() missing 1 required positional argument: 'mcp_session_id'")
+[STARTUP] ensure_indexes() OK
+[MODULE] mount_mcp_streamable_http FAILED: TypeError("StreamableHTTPServerTransport.__init__() missing 1 required positional argument: 'mcp_session_id'")
+[STARTUP] ensure_indexes() OK
+[MODULE] mount_mcp_streamable_http FAILED: TypeError("StreamableHTTPServerTransport.__init__() missing 1 required positional argument: 'mcp_session_id'")
+[STARTUP] ensure_indexes() OK
+[MODULE] mount_mcp_streamable_http FAILED: TypeError("StreamableHTTPServerTransport.__init__() missing 1 required positional argument: 'mcp_session_id'")
+[MODULE] mount_mcp_streamable_http FAILED: TypeError("StreamableHTTPServerTransport.__init__() missing 1 required positional argument: 'mcp_session_id'")
+[STARTUP] ensure_indexes() OK
+[HTTP] /todo/search payload: {'dateFrom': '2025-06-10T18:30:00Z', 'dateTo': '2025-11-10T19:00:00Z'}
+[HTTP] /todo/search returning count: 4
+[MODULE] mount_mcp_streamable_http FAILED: TypeError("StreamableHTTPServerTransport.__init__() missing 1 required positional argument: 'mcp_session_id'")
+[MODULE] mount_mcp_streamable_http OK
+[MODULE] mount_mcp_streamable_http OK
+[STARTUP] ensure_indexes() OK
+[MODULE] mount_mcp_streamable_http OK
+[STARTUP] ensure_indexes() OK
+[STARTUP] ensure_indexes() OK
+[MCP] Streamable HTTP mount skipped: AttributeError("'StreamableHTTPServerTransport' object has no attribute 'handle_post_message'")
+[STARTUP] ensure_indexes() OK
+[MCP] Streamable HTTP mount skipped: AttributeError("'StreamableHTTPServerTransport' object has no attribute 'handle_post_message'")
+[STARTUP] ensure_indexes() OK
+[HTTP] /todo/search payload: {'dateFrom': '2025-06-10T18:30:00Z', 'dateTo': '2025-11-10T19:00:00Z'}
+[HTTP] /todo/search returning count: 4
+[MCP] Streamable HTTP mount skipped: AttributeError("'StreamableHTTPServerTransport' object has no attribute 'handle_post_message'")
+[STARTUP] ensure_indexes() OK
+[MCP] Streamable HTTP mount skipped: AttributeError("'StreamableHTTPServerTransport' object has no attribute 'handle_post_message'")
+[MCP] Streamable HTTP mount skipped: AttributeError("'StreamableHTTPServerTransport' object has no attribute 'handle_post_message'")
+[STARTUP] ensure_indexes() OK
+[HTTP] /calendar/schedule payload: {'title': 'Project sync', 'start': '2025-11-07T18:30:00+05:30', 'end': '2025-11-07T19:00:00+05:30', 'attendees': ['thomastibin@gmail.com'], 'description': 'Agenda ...', 'tz': 'Asia/Kolkata'}
+[HTTP] /calendar/schedule created id: a6er345rg17c0cb3g59cd0ru8o
+[HTTP] /calendar/schedule payload: {'title': 'Project sync', 'start': '2025-11-08T18:30:00+05:30', 'end': '2025-11-08T19:00:00+05:30', 'attendees': ['thomastibin@gmail.com'], 'description': 'Agenda ...', 'tz': 'Asia/Kolkata'}
+[HTTP] /calendar/schedule created id: m1dtae5amgu2rr3792ninom8t4

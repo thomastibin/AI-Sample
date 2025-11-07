@@ -1,0 +1,10 @@
+{
+  "name": "meet-todo-mcp",
+  "version": "1.0.0",
+  "transport": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcpserver.server", "--stdio"]
+  }
+}
+

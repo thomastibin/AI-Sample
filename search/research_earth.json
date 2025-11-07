@@ -1,0 +1,10 @@
+{
+  "topic": "earth",
+  "summary": "Earth is the third planet from the Sun and the only known astronomical object to harbor life, primarily due to its status as an ocean world sustaining liquid surface water. Oceans cover 70.8% of its crust, with the remaining 29.2% being land, much of which is humid and vegetated, and significant ice sheets at the poles. The planet's crust is composed of slowly moving tectonic plates, which cause mountain ranges, volcanoes, and earthquakes. Earth's liquid outer core generates a magnetosphere that deflects harmful solar winds and cosmic radiation.\n\nIts dynamic atmosphere, primarily nitrogen and oxygen, contains water vapor and other greenhouse gases like carbon dioxide, which maintain an average surface temperature of 14.76 °C (58.57 °F), crucial for liquid water. The atmosphere also protects the planet from meteoroids and UV light. Differences in captured solar energy across geographic regions drive atmospheric and ocean currents, creating a global climate system with diverse weather phenomena.",
+  "sources": [
+    "https://en.wikipedia.org/wiki/Earth"
+  ],
+  "tools_used": [
+    "Wikipedia Search"
+  ]
+}

@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+samplemcp.egg-info/PKG-INFO
+samplemcp.egg-info/SOURCES.txt
+samplemcp.egg-info/dependency_links.txt
+samplemcp.egg-info/requires.txt
+samplemcp.egg-info/top_level.txt
+server/__init__.py
+server/main.py

@@ -1,0 +1,6 @@
+# secrets
+.tokens/
+*.secrets.json
+*.token.json
+google_token.jso
+.env*
