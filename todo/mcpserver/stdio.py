@@ -47,9 +47,7 @@ def _desc(s: str) -> str:
 # -------------------------------------------------------------------
 # MCP tools (same behavior, stdio transport)
 # -------------------------------------------------------------------
-host = os.getenv("MCP_HOST", "0.0.0.0")
-port = int(os.getenv("MCP_PORT", "8000"))
-mcp = FastMCP("meet-todo-mcp",  host=host, port=port)
+mcp = FastMCP("meet-todo-mcp")
 
 
 @mcp.tool(
@@ -247,7 +245,7 @@ async def ping() -> str:
 
 
 # -------------------------------------------------------------------
-# Entry point — stdio or streamable-http (env selectable)
+# Entry point — stdio transport only
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     # one-time async startup hook: ensure DB indexes exist
@@ -257,14 +255,5 @@ if __name__ == "__main__":
     except Exception as e:
         dbg("[STARTUP] ensure_indexes() FAILED:", repr(e))
 
-    transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
-    host = os.getenv("MCP_HOST", "0.0.0.0")
-    port = int(os.getenv("MCP_PORT", "8000"))
-
-    if transport == "streamable-http":
-        # Cursor JSON with "type": "streamable_http" will hit this
-        dbg(f"[RUN] transport=streamable-http host={host} port={port}")
-        mcp.run(transport="streamable-http")
-    else:
-        dbg("[RUN] transport=stdio")
-        mcp.run(transport="stdio")
+    # Run the MCP server over stdio (for Cursor / editors)
+    mcp.run(transport="stdio")
