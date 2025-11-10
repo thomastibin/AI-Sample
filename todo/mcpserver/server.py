@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import os
-import uuid
-from typing import Any, Dict, List, Optional
+import inspect
+import sys, pathlib, os, uuid
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 from datetime import datetime
 
 import pytz
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 from dotenv import load_dotenv
@@ -24,20 +25,32 @@ from .calendar_google import search_events, schedule_event
 # ---- MCP core ----
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import RedirectResponse
-from starlette.requests import Request
-# ---- Transport: STREAMABLE HTTP (this is what your env has) ----
-try:
-    from mcp.server.streamable_http import StreamableHTTPServerTransport
-except Exception as e:
-    # alt layout (older wheels) — unlikely, but helpful
-    try:
-        from mcp.server.transport.streamable_http import StreamableHTTPServerTransport  # type: ignore
-    except Exception as e2:
-        raise RuntimeError(
-            "Streamable HTTP transport not found in your MCP install. "
-            "Make sure the 'mcp' package includes 'mcp.server.streamable_http'."
-        ) from e2
+# from starlette.requests import Request
+from mcp.server.streamable_http_manager import StreamableHTTPServerTransport
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# # ---- Transport: STREAMABLE HTTP (version-tolerant import) ----
+# TransportCls = None
+# for path in [
+#     "mcp.transport.http",                # modern path
+#     "mcp.server.transport.streamable_http",  # some older wheels
+#     "mcp.server.streamable_http",        # rare older path
+# ]:
+#     try:
+#         mod = __import__(path, fromlist=["StreamableHTTPServerTransport"])
+#         TransportCls = getattr(mod, "StreamableHTTPServerTransport")
+#         break
+#     except Exception:
+#         continue
+
+# if TransportCls is None:
+#     raise RuntimeError(
+#         "StreamableHTTPServerTransport not found in your MCP install. "
+#         "Try: uv pip install --upgrade mcp"
+#     )
 # -------------------------------------------------------------------
 # Environment / constants
 # -------------------------------------------------------------------
@@ -58,6 +71,15 @@ def dbg(*args, **kwargs):
 # FastAPI app
 # -------------------------------------------------------------------
 app = FastAPI(title="Meet+ToDo MCP (Streamable HTTP)")
+# If you want Cursor / local tools to hit it without CORS pain:
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # or restrict to ["http://localhost:8000", ...]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.on_event("startup")
 async def _startup_ensure_indexes() -> None:
@@ -316,61 +338,118 @@ async def mcp_calendar_schedule(
     return {"id": created.get("id"), "meetLink": created.get("hangoutLink")}
 
 
-# -------------------------------------------------------------------
-# Mount Streamable HTTP transport under /mcp
-#   - GET  /mcp           → 307 redirect to /mcp/
-#   - GET  /mcp/          → opens the read side (long-poll/stream)
-#   - POST /mcp/messages/ → write messages (client → server)
-# -------------------------------------------------------------------
-def mount_mcp_streamable_http(app, mcp_app: FastMCP, base_path: str = "/mcp"):
+# ------------------------------------------------------------------------------
+# Mount Streamable HTTP transport
+# ------------------------------------------------------------------------------
+def mount_mcp_streamable_http(app: FastAPI, mcp_app: FastMCP, base_path: str = "/mcp") -> None:
     server = mcp_app._mcp_server
-    # Some MCP SDK versions require a session id at construction
-    session_id = os.getenv("MCP_SESSION_ID") or str(uuid.uuid4())
-    transport = StreamableHTTPServerTransport(mcp_session_id=session_id)
 
+    # 1) Build transport (positional arg, see section A)
+    session_id = os.getenv("MCP_SESSION_ID") or str(uuid.uuid4())
+    transport = StreamableHTTPServerTransport(session_id)
+
+    # 2) Stream endpoint (GET {base_path}/) — ASGI app
     async def stream_asgi(scope, receive, send):
+        # quick OPTIONS handler for CORS preflight
+        if scope.get("type") == "http" and scope.get("method") == "OPTIONS":
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+            return
+
         if scope.get("type") != "http":
             await send({"type": "http.response.start", "status": 404, "headers": []})
             await send({"type": "http.response.body", "body": b"Not Found"})
             return
-        async with transport.connect(scope, receive, send) as (read, write):
-            await server.run(read, write, server.create_initialization_options())
 
-    # GET stream at /mcp/
+        started = False
+
+        async def logged_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                print("[stream] response.start:", message.get("status"))
+            elif message["type"] == "http.response.body":
+                body = message.get("body") or b""
+                more = message.get("more_body")
+                print(f"[stream] response.body: {len(body)} bytes, more={more}")
+            await send(message)
+
+        sig = inspect.signature(transport.connect)
+        params = list(sig.parameters)
+        print("[stream_asgi] transport.connect params:", params)
+
+        try:
+            if len(params) == 0:
+                async with transport.connect() as (read, write):
+                    await server.run(read, write, server.create_initialization_options())
+            else:  # len(params) == 3  (scope, receive, send)
+                async with transport.connect(scope, receive, logged_send) as (read, write):
+                    await server.run(read, write, server.create_initialization_options())
+            print("[stream_asgi] transport.connect params2:", params)
+            
+        except Exception as e:
+            # If transport failed before starting the response, return a 500 so client isn't left hanging.
+            if not started:
+                await send({"type": "http.response.start", "status": 500, "headers": []})
+                await send({"type": "http.response.body", "body": str(e).encode()})
+            raise
+
+
     app.mount(base_path + "/", stream_asgi)
 
-    # Preferred writer endpoint at /mcp/messages
-    app.mount(base_path + "/messages", transport.handle_post_message)
+    # 3) Write endpoint (POST {base_path}/messages) — name differs across versions
+    post_handler = getattr(transport, "handle_post_message", None) \
+    or getattr(transport, "post_message_app", None) \
+    or getattr(transport, "asgi_post_message", None)
 
-    # Compatibility endpoint: POST /mcp → forward to /mcp/messages
-    @app.post(base_path)
-    async def _compat_post_mcp(request: Request):
-        # reconstruct an ASGI call to the messages handler
-        scope = request.scope.copy()
-        scope["path"] = base_path + "/messages"
-        receive = request._receive  # Starlette provides this on Request
-        send_messages = []
+    # Log what we found so we know what’s mounted
+    print("[mcp] transport writer handler:",
+        "handle_post_message" if getattr(transport, "handle_post_message", None) else
+        "post_message_app"    if getattr(transport, "post_message_app", None)    else
+        "asgi_post_message"   if getattr(transport, "asgi_post_message", None)   else
+        "NONE")
 
-        async def _send(message):
-            send_messages.append(message)
+    if post_handler:
+        # Wrap to log every hit
+        async def _messages_logger(scope, receive, send):
+            if scope.get("type") == "http" and scope.get("method") == "POST":
+                print("[mcp] POST /mcp/messages hit")
+            return await post_handler(scope, receive, send)
 
-        await transport.handle_post_message(scope, receive, _send)
+        # (A) Real writer endpoint
+        app.mount("/mcp/messages", _messages_logger)
 
-        # build a simple JSONResponse from collected send messages
-        # (assumes JSON body; minimal wrapper)
-        body = b""
-        status = 200
-        for m in send_messages:
-            if m["type"] == "http.response.start":
-                status = m.get("status", 200)
-            elif m["type"] == "http.response.body":
-                body += m.get("body", b"")
-        try:
-            return JSONResponse(content=json.loads(body or b"{}"), status_code=status)
-        except Exception:
-            return JSONResponse(content={"ok": True}, status_code=status)
+        # (B) Compatibility shim: POST /mcp → /mcp/messages
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+        import json
 
-# Mount the MCP transport so /mcp endpoints are available
+        @app.post("/mcp", include_in_schema=False)
+        async def _compat_post_mcp(request: Request):
+            scope = request.scope.copy()
+            scope["path"] = "/mcp/messages"
+            receive = request._receive
+            sent = []
+
+            async def _send(message):
+                sent.append(message)
+
+            await post_handler(scope, receive, _send)
+
+            status = 200
+            body = b""
+            for m in sent:
+                if m["type"] == "http.response.start":
+                    status = m.get("status", 200)
+                elif m["type"] == "http.response.body":
+                    body += m.get("body", b"")
+            try:
+                return JSONResponse(content=json.loads(body or b"{}"), status_code=status)
+            except Exception:
+                return JSONResponse(content={"ok": True}, status_code=status)
+    else:
+        print("[mcp] WARNING: transport exposes NO writer handler; "
+            "streamable_http clients will hang (no /mcp/messages).")
 try:
     mount_mcp_streamable_http(app, mcp, base_path="/mcp")
 except Exception as e:

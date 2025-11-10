@@ -63,10 +63,11 @@ class MCPToolRunner:
                 "This LLM expects 'streamable_http' in mcp_manifest.json "
                 "(or 'http' if your client exposes it as an alias)."
             )
-        url = (t.get("url") or "").rstrip("/")  # <- no trailing slash
+        url = t.get("url")   # <- no trailing slash
         if not url:
             raise RuntimeError("Missing 'transport.url' for Streamable HTTP MCP manifest")
-
+        if not url.endswith("/"):
+             url += "/"
         headers = t.get("headers") or {}
         print(f"[MCP START] connecting via STREAMABLE_HTTP to {url} headers={bool(headers)}")
 
@@ -97,9 +98,9 @@ class MCPToolRunner:
             print("[MCP] list_tools OK:", [t.name for t in tools.tools])
             self._started = True
 
-        except Exception:
-            # ensure clean shutdown if start fails mid-way
+        except Exception as e:
             await self.close()
+            print(f"[ERROR111] {e!r}")
             raise
 
         
@@ -395,12 +396,12 @@ async def chat(body: ChatIn):
             print(f"[TIME] overridden end_utc from endText={end_utc}")
 
         base_http = os.getenv("MCP_HTTP_BASE")
-        if base_http:
-            runner = HTTPMCPToolRunner(base_http)
-        else:
-            runner = MCPToolRunner(
-                manifest_path=os.path.join(os.path.dirname(__file__), "mcp_manifest.json")
-            )
+        # if base_http:
+        #     runner = HTTPMCPToolRunner(base_http)
+        # else:
+        runner = MCPToolRunner(
+            manifest_path=os.path.join(os.path.dirname(__file__), "mcp_manifest.json")
+        )
         await runner.start()
         try:
             if intent == "schedule_meeting":
