@@ -1,35 +1,102 @@
-# llm_server_gemini_autotool.py
+# llm_server/main.py
 from __future__ import annotations
 
-import os, json
-from typing import Any
+import os, json, asyncio
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+import httpx
+import time
+
+import pytz
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from google import genai
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_google_genai import ChatGoogleGenerativeAI
+
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.session import ClientSession
+from contextlib import asynccontextmanager
+from .time_utils import parse_human_time_to_utc_window
+from contextlib import asynccontextmanager
+
+import httpx
+import time
 
 load_dotenv()
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Asia/Kolkata")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-def _gemini_client() -> genai.Client:
+# ---------- LLM (planner) ----------
+def _new_llm() -> ChatGoogleGenerativeAI:
     key = os.getenv("GEMINI_API_KEY")
     if not key:
-        raise RuntimeError("GEMINI_API_KEY is missing in environment")
-    return genai.Client(api_key=key)
+        raise RuntimeError("GEMINI_API_KEY missing in environment")
+    return ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=key, temperature=0)
 
-def _read_manifest_url(default_path: str) -> str:
-    # 1) Prefer an explicit env URL (use EXACTLY as given; don't strip or rstrip)
+def _intent_chain():
+    schema_desc = (
+        "Return ONLY valid JSON with keys: "
+        "intent (schedule_meeting|search_todos|search_meetings), "
+        "title (string), attendees (array of emails), startText (string), endText (optional string). "
+        "Rules: "
+        "1) Always include startText. "
+        "2) If duration is not explicitly provided, set endText = startText + 30 minutes. "
+        "3) Use Asia/Kolkata timezone by default unless the user specifies otherwise (e.g., IST/UTC offsets). "
+        '4) Respond with only RFC3339 with timezone in startText/endText (e.g., "2025-11-10T12:00:00+05:30"). '
+        "5) Do NOT invent attendees; only include emails present in the message. "
+        "6) Respond with only JSON, no comments."
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You extract structured planning JSON for a meeting/todo agent.\n"
+         "{schema_desc}\n\nExamples:\n{few_shot_examples}"),
+        ("human", "Message: {message}\nRespond with only JSON, no commentary."),
+    ])
+    return prompt, schema_desc.replace("\n", " ")
+
+def _parse_plan_json(text: str) -> Dict[str, Any]:
+    start = text.find("{"); end = text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("LLM did not return JSON")
+    return json.loads(text[start:end+1])
+
+def _normalize_plan(plan: Dict[str, Any], original_text: str) -> Dict[str, Any]:
+    if not isinstance(plan, dict):
+        return {}
+    if plan.get("intent"):
+        return plan
+    action = plan.get("action")
+    typ = plan.get("type") or plan.get("subject")
+    filters = plan.get("filters") or {}
+    if action in ("read", "list", "get") and isinstance(typ, str) and "sched" in typ.lower():
+        date = filters.get("target_date") or filters.get("date") or filters.get("targetDate")
+        return {
+            "intent": "search_meetings",
+            "title": plan.get("title"),
+            "attendees": plan.get("attendees") or [],
+            "startText": date or original_text,
+            "endText": None,
+        }
+    if isinstance(filters, dict) and any("date" in k.lower() for k in filters.keys()):
+        date = filters.get("target_date") or filters.get("date") or filters.get("start")
+        return {
+            "intent": "search_meetings",
+            "title": plan.get("title"),
+            "attendees": plan.get("attendees") or [],
+            "startText": date or original_text,
+            "endText": None,
+        }
+    return plan
+
+# ---------- MCP URL ----------
+def _read_mcp_url(default_manifest_path: str) -> str:
     env_url = os.getenv("MCP_SERVER_URL")
     if env_url and env_url.strip():
-        return env_url.strip()  # keep trailing slash if present
-
-    # 2) Else load from manifest JSON (again, keep it EXACT)
-    manifest_path = os.getenv("MCP_MANIFEST_PATH") or default_path
+        return env_url.strip()  # keep exactly as provided
+    manifest_path = os.getenv("MCP_MANIFEST_PATH") or default_manifest_path
     with open(manifest_path, "r", encoding="utf-8") as f:
         m = json.load(f)
     t = (m.get("transport") or {})
@@ -38,95 +105,306 @@ def _read_manifest_url(default_path: str) -> str:
     url = (t.get("url") or "")
     if not url:
         raise RuntimeError("Manifest missing transport.url")
-    return url  # DO NOT rstrip("/")
+    return url  # keep trailing slash if present
 
-def _extract_text(resp: Any) -> str:
+# ---------- Robust extractor ----------
+def _extract_mcp_json(result: Any) -> Any:
+    """
+    Handles MCP ToolResult:
+      result.content = [{"type":"application/json","json": <payload>}, ...]
+    Also supports Pydantic v2 objects via model_dump()/model_dump_json(),
+    and generic .json (string) cases.
+    """
     try:
-        if hasattr(resp, "text") and isinstance(resp.text, str) and resp.text.strip():
-            return resp.text.strip()
-        parts = []
-        for cand in getattr(resp, "candidates", []) or []:
-            for part in getattr(cand, "content", {}).get("parts", []):
-                if isinstance(part, dict) and part.get("text"):
-                    parts.append(part["text"])
-        return "\n".join(p.strip() for p in parts if isinstance(p, str) or p)
+        content = getattr(result, "content", None)
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and "json" in item:
+                    return item["json"]
+                if hasattr(item, "model_dump"):
+                    return item.model_dump()
+                if hasattr(item, "model_dump_json"):
+                    try:
+                        return json.loads(item.model_dump_json())
+                    except Exception:
+                        return item.model_dump_json()
+                if hasattr(item, "json"):
+                    attr = getattr(item, "json")
+                    try:
+                        val = attr() if callable(attr) else attr
+                    except Exception:
+                        val = attr
+                    if isinstance(val, str):
+                        try: return json.loads(val)
+                        except Exception: return val
+                    return val
+            for item in content:
+                if isinstance(item, dict) and "text" in item:
+                    return item["text"]
+                if hasattr(item, "text"):
+                    return getattr(item, "text")
+        if isinstance(result, (dict, list)):
+            return result
     except Exception:
-        return ""
+        pass
+    return result
 
-def _serialize_tools(list_tools_resp):
-    return [
-        {
-            "name": t.name,
-            "description": (t.description or "").strip(),
-            "input_schema": getattr(t, "inputSchema", None),
-        }
-        for t in list_tools_resp.tools
-    ]
+# ---------- Singleton Streamable-HTTP session ----------
+class MCPBus:
+    """
+    Keeps one long-lived Streamable-HTTP connection and ClientSession alive
+    for the whole FastAPI process. Adds a preflight check/retry so we don't
+    try to open the tunnel before the MCP server is ready.
+    """
+    def __init__(self, manifest_path: str):
+        self.manifest_path = manifest_path
+        self._cm = None
+        self._read = None
+        self._write = None
+        self.session: Optional[ClientSession] = None
+        self._lock = asyncio.Lock()
 
-class ChatIn(BaseModel):
-    message: str = Field(..., min_length=1)
+    async def _preflight(self, url: str, timeout_total: float = 15.0) -> None:
+        """
+        Verify the MCP server is alive on `url` before opening streamable_http.
+        We try a simple GET (FastMCP returns 200) and a POST with a tiny body.
+        Retries for ~15s.
+        """
+        print(f"[MCPBus] Preflight MCP URL: {url}")
+        deadline = time.monotonic() + timeout_total
+        last_err = None
+        async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
+            while time.monotonic() < deadline:
+                try:
+                    # GET should succeed with 200 on FastMCP /mcp
+                    r = await client.get(url)
+                    if r.status_code == 200:
+                        return
+                except Exception as e:
+                    last_err = e
+                await asyncio.sleep(0.5)
 
-app = FastAPI(title="Gemini + MCP (auto tool) via streamable_http")
+            # As a second signal, try a tiny POST (some servers accept 202/200)
+            try:
+                r = await client.post(url, content=b"{}")
+                if 200 <= r.status_code < 400:
+                    return
+            except Exception as e:
+                last_err = e
+
+        raise RuntimeError(f"Preflight to MCP server failed: {last_err or 'no response'}")
+
+    async def start(self):
+        if self.session:
+            return
+
+        url = _read_mcp_url(self.manifest_path)
+        # IMPORTANT: Do not mutate/strip this URL; use exactly what you configured.
+        print(f"[MCPBus] Using MCP URL exactly as given: {url}")
+
+        # 1) Preflight with retries so we don't race FastAPI startup vs MCP
+        await self._preflight(url)
+
+        # 2) Open the streamable-http tunnel
+        self._cm = streamablehttp_client(url)
+        entered = await self._cm.__aenter__()
+        if isinstance(entered, tuple):
+            self._read, self._write = entered[0], entered[1]
+        else:
+            self._read = getattr(entered, "read", None)
+            self._write = getattr(entered, "write", None)
+            if self._read is None or self._write is None:
+                raise RuntimeError("Cannot obtain read/write from streamablehttp_client")
+
+        self.session = ClientSession(self._read, self._write)
+        await self.session.__aenter__()
+        await self.session.initialize()
+
+        listed = await self.session.list_tools()
+        print("[MCP] Ready. Tools:", [t.name for t in listed.tools])
+
+    async def stop(self):
+        try:
+            if self.session:
+                await self.session.__aexit__(None, None, None)
+        finally:
+            self.session = None
+            if self._cm:
+                await self._cm.__aexit__(None, None, None)
+                self._cm = None
+                self._read = self._write = None
+
+    async def call(self, tool: str, params: Dict[str, Any]) -> Any:
+        if not self.session:
+            await self.start()
+        async with self._lock:
+            res = await self.session.call_tool(tool, params)
+            return _extract_mcp_json(res)
+
+# ---------- FastAPI wiring ----------
+app = FastAPI(title="Meet+ToDo LLM Server (Streamable HTTP MCP)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
+_mcp_bus: Optional[MCPBus] = None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _mcp_bus
+    default_manifest = os.path.join(os.path.dirname(__file__), "mcp_manifest.json")
+    _mcp_bus = MCPBus(default_manifest)
+    await _mcp_bus.start()
+    try:
+        yield
+    finally:
+        if _mcp_bus:
+            await _mcp_bus.stop()
+            _mcp_bus = None
+
+app.router.lifespan_context = lifespan  
+
+
+@app.on_event("startup")
+async def _startup():
+    global _mcp_bus
+    default_manifest = os.path.join(os.path.dirname(__file__), "mcp_manifest.json")
+    _mcp_bus = MCPBus(default_manifest)
+    await _mcp_bus.start()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _mcp_bus
+    if _mcp_bus:
+        await _mcp_bus.stop()
+        _mcp_bus = None
+
+class ChatIn(BaseModel):
+    message: str
+
 @app.post("/chat")
 async def chat(body: ChatIn):
     try:
-        default_manifest = os.path.join(os.path.dirname(__file__), "mcp_manifest.json")
-        mcp_url = _read_manifest_url(default_manifest)
+        prompt, schema_desc = _intent_chain()
+        chain = prompt | _new_llm() | StrOutputParser()
+        few_shot_examples = (
+            "Example 1:\n"
+            "Input: \"3pm next week with tibin@gmail.com\"\n"
+            "Output:\n"
+            "{\n"
+            "  \"intent\": \"schedule_meeting\",\n"
+            "  \"title\": \"Meeting\",\n"
+            "  \"attendees\": [\"tibin@gmail.com\"],\n"
+            "  \"startText\": \"2025-11-01T00:00:00+05:30\",\n"
+            "  \"endText\": \"2025-11-01T00:30:00+05:30\"\n"
+            "}\n\n"
+            "Example 2:\n"
+            "Input: \"list online meetings next 48h\"\n"
+            "Output:\n"
+            "{\n"
+            "  \"intent\": \"search_meetings\",\n"
+            "  \"title\": \"Online meetings\",\n"
+            "  \"attendees\": [],\n"
+            "  \"startText\": \"2025-11-01T00:00:00+05:30\",\n"
+            "  \"endText\": \"2025-11-01T00:30:00+05:30\"\n"
+            "}\n\n"
+            "Example 3:\n"
+            "Input: \"show my todos next week\"\n"
+            "Output:\n"
+            "{\n"
+            "  \"intent\": \"search_todos\",\n"
+            "  \"title\": \"Todos\",\n"
+            "  \"attendees\": [],\n"
+            "  \"startText\": \"2025-11-01T00:00:00+05:30\",\n"
+            "  \"endText\": \"2025-11-07T23:59:59+05:30\"\n"
+            "}"
+        )
+        raw = await chain.ainvoke({
+            "message": body.message,
+            "schema_desc": schema_desc,
+            "few_shot_examples": few_shot_examples
+        })
+        plan = _parse_plan_json(raw)
+        plan = _normalize_plan(plan, body.message)
 
-        client = _gemini_client()
+        intent = plan.get("intent")
+        if intent not in {"schedule_meeting", "search_todos", "search_meetings"}:
+            return {"error": True, "message": f"Invalid intent: {intent}"}
 
-        # Keep the streamable-http session OPEN while Gemini runs.
-        async with streamablehttp_client(mcp_url) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+        title = plan.get("title") or "Meeting"
+        attendees = plan.get("attendees") or []
+        start_text = plan.get("startText") or body.message
+        end_text = plan.get("endText")
 
-                listed = await session.list_tools()  # only ONCE
-                tools_out = _serialize_tools(listed)
-                if os.getenv("LOG_MCP_TOOLS", "1") == "1":
-                    print("[MCP] Tools available:")
-                    for i, t in enumerate(tools_out, 1):
-                        print(f"  {i}. {t['name']} — {t['description']}")
+        start_utc, end_utc, tz_name = parse_human_time_to_utc_window(start_text, DEFAULT_TZ)
+        if end_text:
+            e2, _, _ = parse_human_time_to_utc_window(end_text, tz_name)
+            end_utc = e2
 
-                # Let Gemini auto-select and execute MCP tools
-                resp = await client.aio.models.generate_content(
-                    model=MODEL_NAME,
-                    contents=body.message,
-                    config=genai.types.GenerateContentConfig(
-                        temperature=0,
-                        tools=[session],   # pass the MCP session directly
-                        # tool_choice defaults to AUTO; omit to reduce surface for bugs
-                    ),
-                )
+        assert _mcp_bus and _mcp_bus.session, "MCP bus not initialized"
+        mcp = _mcp_bus
 
-        text = _extract_text(resp)
-        if not text:
-            try:
-                return {"ok": True, "text": "", "raw": json.loads(resp.to_json())}
-            except Exception:
-                return {"ok": True, "text": "", "raw": str(resp)}
+        if intent == "schedule_meeting":
+            pad = timedelta(minutes=30)
+            cal_events = await mcp.call("calendar.search", {
+                "dateFrom": (start_utc - pad).isoformat(),
+                "dateTo":   (end_utc + pad).isoformat(),
+                "attendees": attendees
+            })
+            if isinstance(cal_events, list) and len(cal_events) > 0:
+                local_zone = pytz.timezone(tz_name)
+                start_local = start_utc.astimezone(local_zone)
+                alts = []
+                for mins in (30, 60):
+                    t = (start_local + timedelta(minutes=mins)).astimezone(local_zone)
+                    alts.append(t.strftime("%I:%M %p %Z").lstrip("0"))
+                return {"conflict": True, "events": cal_events, "suggestions": alts}
 
-        return {"ok": True, "text": text}
+            cal_created = await mcp.call("calendar.schedule", {
+                "title": title,
+                "start": start_utc.astimezone(pytz.timezone(tz_name)).isoformat(),
+                "end":   end_utc.astimezone(pytz.timezone(tz_name)).isoformat(),
+                "attendees": attendees,
+                "description": plan.get("description") or "",
+                "tz": tz_name,
+            })
+            todo_created = await mcp.call("todo.create", {
+                "title": title,
+                "start": start_utc.isoformat(),
+                "end":   end_utc.isoformat(),
+                "attendees": attendees,
+                "description": plan.get("description") or "",
+                "tz": tz_name,
+            })
+            return {"ok": True, "event": cal_created or {}, "todo": todo_created or {}}
 
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=400, detail={"error": True, "message": f"Manifest not found: {e}"})
+        elif intent == "search_todos":
+            results = await mcp.call("todo.search", {
+                "dateFrom": start_utc.isoformat(),
+                "dateTo":   end_utc.isoformat(),
+                "text": None
+            })
+            return {"ok": True, "todos": results or []}
+
+        elif intent == "search_meetings":
+            results = await mcp.call("calendar.search", {
+                "dateFrom": start_utc.isoformat(),
+                "dateTo":   end_utc.isoformat(),
+                "attendees": attendees or []
+            })
+            return {"ok": True, "events": results or []}
+
+        return {"error": True, "message": "Unknown state"}
+
     except Exception as e:
-        # Unwrap ExceptionGroup/TaskGroup for clearer Postman errors (Py 3.11+)
         detail = {"error": True, "message": f"{type(e).__name__}: {str(e)}"}
-        # ExceptionGroup has .exceptions; include first few
-        suberrs = getattr(e, "exceptions", None)
-        if suberrs:
-            detail["suberrors"] = [f"{type(se).__name__}: {se}" for se in suberrs][:3]
+        subs = getattr(e, "exceptions", None)
+        if subs:
+            detail["suberrors"] = [f"{type(se).__name__}: {se}" for se in subs][:3]
         raise HTTPException(status_code=400, detail=detail)
- 
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT_LLM", "8001"))
-    uvicorn.run("llm_server.main:app", host="0.0.0.0", port=port, reload=True)
-
+    uvicorn.run("llm_server.main:app", host="0.0.0.0", port=port, reload=False)
