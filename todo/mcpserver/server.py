@@ -14,7 +14,7 @@ from .schemas import (
     TodoSearchIn, TodoCreateIn, StatusUpdateIn,
     CalSearchIn, CalScheduleIn, ensure_tz_and_utc,
 )
-from .mongo import ensure_indexes, search_todos, create_todo, update_status
+from .mongo import ensure_indexes_safe, search_todos, create_todo, update_status
 from .models import to_todo_out
 from .calendar_google import search_events, schedule_event
 
@@ -82,7 +82,7 @@ async def mcp_todo_search(
 @mcp.tool(
     name="todo.create",
     description=_desc("""
-        Create a todo/event.
+        Create a todo/event which may or may not be an online event and default the meeting last for 1 hour;.
         Required:
           - title: string
           - start: ISO8601 datetime string (can include offset or local + tz)
@@ -103,7 +103,7 @@ async def mcp_todo_create(
     attendees: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Create a new todo; times are normalized to UTC before persistence.
+    Create a new todo; times are normalized to UTC before persistence
     """
     try:
         parsed = TodoCreateIn(
@@ -116,7 +116,7 @@ async def mcp_todo_create(
         )
         start_utc = ensure_tz_and_utc(parsed.start, parsed.tz)
         end_utc = ensure_tz_and_utc(parsed.end, parsed.tz)
-        now = datetime.utcnow().replace(tzinfo=pytz.UTC)
+        now = datetime.now(UTC)
 
         data = {
             "title": parsed.title,
@@ -236,6 +236,47 @@ async def mcp_calendar_schedule(
     except ValidationError as ve:
         raise ValueError(str(ve))
 
+@mcp.tool(
+    name="time.nowIST",
+    description=_desc("""
+        Return the current date and time in IST (Asia/Kolkata).
+        Optional 'format' can be one of: iso | rfc3339 | pretty | epoch_ms.
+        Defaults to iso. Also returns a full JSON bundle when no format is given.
+    """),
+)
+async def time_now_ist(format: Optional[str] = None) -> Dict[str, Any] | str | int:
+    """
+    Current time in Asia/Kolkata. If 'format' is provided, returns only that field:
+      - iso:      e.g., '2025-11-11T12:34:56+05:30'
+      - rfc3339:  e.g., '2025-11-11T12:34:56+0530'   (no colon in offset)
+      - pretty:   e.g., 'Tue, 11 Nov 2025 12:34:56 PM IST'
+      - epoch_ms: e.g., 1731318296000
+    Otherwise returns a JSON object with all fields.
+    """
+    tz = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(tz)
+
+    data: Dict[str, Any] = {
+        "timezone": "Asia/Kolkata",
+        "offset": "+05:30",
+        "iso": now.isoformat(timespec="seconds"),            # 2025-11-11T12:34:56+05:30
+        "rfc3339": now.strftime("%Y-%m-%dT%H:%M:%S%z"),      # 2025-11-11T12:34:56+0530
+        "pretty": now.strftime("%a, %d %b %Y %I:%M:%S %p %Z"),
+        "epoch_ms": int(now.timestamp() * 1000),
+    }
+
+    if format:
+        f = format.lower()
+        if f == "iso":
+            return data["iso"]
+        if f == "rfc3339":
+            return data["rfc3339"]
+        if f == "pretty":
+            return data["pretty"]
+        if f in ("epoch", "epoch_ms"):
+            return data["epoch_ms"]
+        # Unknown format -> return the full bundle so caller can choose
+    return data
 
 # (Optional but handy) a simple connectivity check
 @mcp.tool(
@@ -250,21 +291,18 @@ async def ping() -> str:
 # Entry point — stdio or streamable-http (env selectable)
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    # one-time async startup hook: ensure DB indexes exist
     try:
-        asyncio.run(ensure_indexes())
-        dbg("[STARTUP] ensure_indexes() OK")
+        # Run index creation using a TEMP client bound to this moment's loop,
+        # then immediately close it. No globals reused.
+        import asyncio
+        asyncio.run(ensure_indexes_safe())
     except Exception as e:
-        dbg("[STARTUP] ensure_indexes() FAILED:", repr(e))
+        print("[STARTUP][WARN] ensure_indexes_safe failed:", repr(e))
 
+    # Now start MCP. It will create its own loop; mongo client will be created
+    # lazily on that loop via init_mongo() from tool calls.
     transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
-    host = os.getenv("MCP_HOST", "0.0.0.0")
-    port = int(os.getenv("MCP_PORT", "8000"))
-
     if transport == "streamable-http":
-        # Cursor JSON with "type": "streamable_http" will hit this
-        dbg(f"[RUN] transport=streamable-http host={host} port={port}")
         mcp.run(transport="streamable-http")
     else:
-        dbg("[RUN] transport=stdio")
         mcp.run(transport="stdio")
