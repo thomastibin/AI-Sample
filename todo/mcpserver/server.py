@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, asyncio, traceback
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime,timezone
 import pytz
 from pydantic import ValidationError
 from dotenv import load_dotenv
@@ -10,7 +10,7 @@ from .schemas import (
     TodoSearchIn, TodoCreateIn, StatusUpdateIn,
     CalSearchIn, CalScheduleIn, ensure_tz_and_utc,
 )
-from .mongo import ensure_indexes, search_todos, create_todo, update_status
+from .mongo import ensure_indexes_safe, search_todos, create_todo, update_status
 from .models import to_todo_out
 from .calendar_google import search_events, schedule_event
 
@@ -74,7 +74,7 @@ async def mcp_todo_create(
     )
     start_utc = ensure_tz_and_utc(parsed.start, parsed.tz)
     end_utc = ensure_tz_and_utc(parsed.end, parsed.tz)
-    now = datetime.utcnow().replace(tzinfo=pytz.UTC)
+    now = datetime.now(timezone.utc)
     data = {
         "title": parsed.title,
         "description": parsed.description or "",
@@ -148,18 +148,18 @@ async def ping() -> str:
     return "pong"
 
 if __name__ == "__main__":
-    # DB indexes BEFORE run (safe now that the client is singleton on server side)
     try:
-        asyncio.run(ensure_indexes())
-        dbg("[STARTUP] ensure_indexes() OK")
+        # Run index creation using a TEMP client bound to this moment's loop,
+        # then immediately close it. No globals reused.
+        import asyncio
+        asyncio.run(ensure_indexes_safe())
     except Exception as e:
-        dbg("[STARTUP] ensure_indexes() FAILED:", repr(e))
-        traceback.print_exc()
+        print("[STARTUP][WARN] ensure_indexes_safe failed:", repr(e))
 
+    # Now start MCP. It will create its own loop; mongo client will be created
+    # lazily on that loop via init_mongo() from tool calls.
     transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
     if transport == "streamable-http":
-        dbg(f"[RUN] transport=streamable-http host={host} port={port}")
         mcp.run(transport="streamable-http")
     else:
-        dbg("[RUN] transport=stdio")
         mcp.run(transport="stdio")

@@ -1,11 +1,9 @@
 # llm_server/main.py
 from __future__ import annotations
 
-import os, json, asyncio
+import os, json, asyncio, time
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta
-import httpx
-import time
+from datetime import timedelta
 
 import pytz
 from fastapi import FastAPI, HTTPException
@@ -20,14 +18,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.session import ClientSession
 from contextlib import asynccontextmanager
-from .time_utils import parse_human_time_to_utc_window
-from contextlib import asynccontextmanager
-
 import httpx
-import time
+
+from .time_utils import parse_human_time_to_utc_window
 
 load_dotenv()
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Asia/Kolkata")
+
 
 # ---------- LLM (planner) ----------
 def _new_llm() -> ChatGoogleGenerativeAI:
@@ -39,7 +36,7 @@ def _new_llm() -> ChatGoogleGenerativeAI:
 def _intent_chain():
     schema_desc = (
         "Return ONLY valid JSON with keys: "
-        "intent (schedule_meeting|search_todos|search_meetings), "
+        "intent (schedule_meeting|search_todos|search_meetings|todo.create), "
         "title (string), attendees (array of emails), startText (string), endText (optional string). "
         "Rules: "
         "1) Always include startText. "
@@ -48,6 +45,7 @@ def _intent_chain():
         '4) Respond with only RFC3339 with timezone in startText/endText (e.g., "2025-11-10T12:00:00+05:30"). '
         "5) Do NOT invent attendees; only include emails present in the message. "
         "6) Respond with only JSON, no comments."
+        "7) if event is not online or no email is given, then intent is todo.create."
     )
     prompt = ChatPromptTemplate.from_messages([
         ("system",
@@ -91,6 +89,7 @@ def _normalize_plan(plan: Dict[str, Any], original_text: str) -> Dict[str, Any]:
         }
     return plan
 
+
 # ---------- MCP URL ----------
 def _read_mcp_url(default_manifest_path: str) -> str:
     env_url = os.getenv("MCP_SERVER_URL")
@@ -107,17 +106,20 @@ def _read_mcp_url(default_manifest_path: str) -> str:
         raise RuntimeError("Manifest missing transport.url")
     return url  # keep trailing slash if present
 
+
 # ---------- Robust extractor ----------
 def _extract_mcp_json(result: Any) -> Any:
     """
-    Handles MCP ToolResult:
-      result.content = [{"type":"application/json","json": <payload>}, ...]
-    Also supports Pydantic v2 objects via model_dump()/model_dump_json(),
-    and generic .json (string) cases.
+    Handles:
+      result.content = [{"type":"application/json","json": <payload>}, {"type":"text","text": "..."}]
+      Pydantic v2 via .model_dump() / .model_dump_json()
+      Generic .json() as string
+    Falls back to 'text' if only a text error was returned by the server.
     """
     try:
         content = getattr(result, "content", None)
         if isinstance(content, list):
+            # Prefer JSON parts
             for item in content:
                 if isinstance(item, dict) and "json" in item:
                     return item["json"]
@@ -135,26 +137,28 @@ def _extract_mcp_json(result: Any) -> Any:
                     except Exception:
                         val = attr
                     if isinstance(val, str):
-                        try: return json.loads(val)
-                        except Exception: return val
+                        try:
+                            return json.loads(val)
+                        except Exception:
+                            return val
                     return val
+            # Then try text
             for item in content:
                 if isinstance(item, dict) and "text" in item:
-                    return item["text"]
+                    return {"error": True, "message": item["text"]}
                 if hasattr(item, "text"):
-                    return getattr(item, "text")
+                    return {"error": True, "message": getattr(item, "text")}
         if isinstance(result, (dict, list)):
             return result
     except Exception:
         pass
     return result
 
+
 # ---------- Singleton Streamable-HTTP session ----------
 class MCPBus:
     """
-    Keeps one long-lived Streamable-HTTP connection and ClientSession alive
-    for the whole FastAPI process. Adds a preflight check/retry so we don't
-    try to open the tunnel before the MCP server is ready.
+    One long-lived streamable_http tunnel + ClientSession.
     """
     def __init__(self, manifest_path: str):
         self.manifest_path = manifest_path
@@ -166,55 +170,49 @@ class MCPBus:
 
     async def _preflight(self, url: str, timeout_total: float = 15.0) -> None:
         """
-        Verify the MCP server is alive on `url` before opening streamable_http.
-        We try a simple GET (FastMCP returns 200) and a POST with a tiny body.
-        Retries for ~15s.
+        Consider 200–499 a 'responsive' endpoint (FastMCP may 404 on GET /mcp).
         """
         print(f"[MCPBus] Preflight MCP URL: {url}")
         deadline = time.monotonic() + timeout_total
         last_err = None
-        async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=2.0) as client:
             while time.monotonic() < deadline:
                 try:
-                    # GET should succeed with 200 on FastMCP /mcp
                     r = await client.get(url)
-                    if r.status_code == 200:
+                    if 200 <= r.status_code < 500:
                         return
                 except Exception as e:
                     last_err = e
                 await asyncio.sleep(0.5)
+        # If GET preflight fails, we'll still try opening the tunnel with retries
+        print(f"[MCPBus] Preflight GET failed (non-fatal): {last_err}")
 
-            # As a second signal, try a tiny POST (some servers accept 202/200)
+    async def _open_tunnel_with_retries(self, url: str, retries: int = 10, delay: float = 0.5):
+        for i in range(retries):
             try:
-                r = await client.post(url, content=b"{}")
-                if 200 <= r.status_code < 400:
-                    return
+                self._cm = streamablehttp_client(url)
+                entered = await self._cm.__aenter__()
+                if isinstance(entered, tuple):
+                    self._read, self._write = entered[0], entered[1]
+                else:
+                    self._read = getattr(entered, "read", None)
+                    self._write = getattr(entered, "write", None)
+                    if self._read is None or self._write is None:
+                        raise RuntimeError("Cannot obtain read/write from streamablehttp_client")
+                return
             except Exception as e:
-                last_err = e
-
-        raise RuntimeError(f"Preflight to MCP server failed: {last_err or 'no response'}")
+                if i == retries - 1:
+                    raise
+                await asyncio.sleep(delay)
 
     async def start(self):
         if self.session:
             return
+        url = _read_mcp_url(os.path.join(os.path.dirname(__file__), "mcp_manifest.json"))
+        print(f"[MCPBus] Using MCP URL: {url}")
 
-        url = _read_mcp_url(self.manifest_path)
-        # IMPORTANT: Do not mutate/strip this URL; use exactly what you configured.
-        print(f"[MCPBus] Using MCP URL exactly as given: {url}")
-
-        # 1) Preflight with retries so we don't race FastAPI startup vs MCP
         await self._preflight(url)
-
-        # 2) Open the streamable-http tunnel
-        self._cm = streamablehttp_client(url)
-        entered = await self._cm.__aenter__()
-        if isinstance(entered, tuple):
-            self._read, self._write = entered[0], entered[1]
-        else:
-            self._read = getattr(entered, "read", None)
-            self._write = getattr(entered, "write", None)
-            if self._read is None or self._write is None:
-                raise RuntimeError("Cannot obtain read/write from streamablehttp_client")
+        await self._open_tunnel_with_retries(url)
 
         self.session = ClientSession(self._read, self._write)
         await self.session.__aenter__()
@@ -241,6 +239,7 @@ class MCPBus:
             res = await self.session.call_tool(tool, params)
             return _extract_mcp_json(res)
 
+
 # ---------- FastAPI wiring ----------
 app = FastAPI(title="Meet+ToDo LLM Server (Streamable HTTP MCP)")
 app.add_middleware(
@@ -250,11 +249,11 @@ app.add_middleware(
 )
 
 _mcp_bus: Optional[MCPBus] = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _mcp_bus
-    default_manifest = os.path.join(os.path.dirname(__file__), "mcp_manifest.json")
-    _mcp_bus = MCPBus(default_manifest)
+    _mcp_bus = MCPBus(os.path.join(os.path.dirname(__file__), "mcp_manifest.json"))
     await _mcp_bus.start()
     try:
         yield
@@ -263,29 +262,17 @@ async def lifespan(app: FastAPI):
             await _mcp_bus.stop()
             _mcp_bus = None
 
-app.router.lifespan_context = lifespan  
+app.router.lifespan_context = lifespan  # <-- ONLY lifespan; remove on_event handlers
 
-
-@app.on_event("startup")
-async def _startup():
-    global _mcp_bus
-    default_manifest = os.path.join(os.path.dirname(__file__), "mcp_manifest.json")
-    _mcp_bus = MCPBus(default_manifest)
-    await _mcp_bus.start()
-
-@app.on_event("shutdown")
-async def _shutdown():
-    global _mcp_bus
-    if _mcp_bus:
-        await _mcp_bus.stop()
-        _mcp_bus = None
 
 class ChatIn(BaseModel):
     message: str
 
+
 @app.post("/chat")
 async def chat(body: ChatIn):
     try:
+        # PHASE A: plan
         prompt, schema_desc = _intent_chain()
         chain = prompt | _new_llm() | StrOutputParser()
         few_shot_examples = (
@@ -329,7 +316,8 @@ async def chat(body: ChatIn):
         plan = _normalize_plan(plan, body.message)
 
         intent = plan.get("intent")
-        if intent not in {"schedule_meeting", "search_todos", "search_meetings"}:
+        print(f"[LLM] Extracted plan: intent={intent}, title={plan.get('title')}")
+        if intent not in {"schedule_meeting", "search_todos", "search_meetings","todo.create"}:
             return {"error": True, "message": f"Invalid intent: {intent}"}
 
         title = plan.get("title") or "Meeting"
@@ -342,6 +330,7 @@ async def chat(body: ChatIn):
             e2, _, _ = parse_human_time_to_utc_window(end_text, tz_name)
             end_utc = e2
 
+        # PHASE B: execute
         assert _mcp_bus and _mcp_bus.session, "MCP bus not initialized"
         mcp = _mcp_bus
 
@@ -394,6 +383,16 @@ async def chat(body: ChatIn):
                 "attendees": attendees or []
             })
             return {"ok": True, "events": results or []}
+        elif intent == "todo.create":
+            todo_created = await mcp.call("todo.create", {
+                "title": title,
+                "start": start_utc.isoformat(),
+                "end":   end_utc.isoformat(),
+                "attendees": attendees,
+                "description": plan.get("description") or "",
+                "tz": tz_name,
+            })
+            return {"ok": True,   "todo": todo_created or {}}
 
         return {"error": True, "message": "Unknown state"}
 
@@ -403,6 +402,7 @@ async def chat(body: ChatIn):
         if subs:
             detail["suberrors"] = [f"{type(se).__name__}: {se}" for se in subs][:3]
         raise HTTPException(status_code=400, detail=detail)
+
 
 if __name__ == "__main__":
     import uvicorn

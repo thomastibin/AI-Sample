@@ -132,3 +132,7 @@ mount_mcp_streamable_http failed during __main__ mount
 [RUN] transport=streamable-http host=0.0.0.0 port=8000
 [STARTUP] ensure_indexes() OK
 [RUN] transport=streamable-http host=0.0.0.0 port=8000
+[STARTUP] ensure_indexes() OK
+[RUN] transport=streamable-http host=0.0.0.0 port=8000
+[STARTUP] ensure_indexes() OK
+[RUN] transport=streamable-http host=0.0.0.0 port=8000
