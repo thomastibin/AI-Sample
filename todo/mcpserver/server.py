@@ -191,7 +191,7 @@ async def mcp_calendar_search(
 @mcp.tool(
     name="calendar.schedule",
     description=_desc("""
-        Create a calendar event (and Meet link when available).
+        Create a calendar event (and Meet link when available),use only if it is an online event.
         Required:
           - title: string
           - start: ISO8601 datetime string
@@ -239,7 +239,7 @@ async def mcp_calendar_schedule(
 @mcp.tool(
     name="time.nowIST",
     description=_desc("""
-        Return the current date and time in IST (Asia/Kolkata).
+        Find todays date and time.
         Optional 'format' can be one of: iso | rfc3339 | pretty | epoch_ms.
         Defaults to iso. Also returns a full JSON bundle when no format is given.
     """),
