@@ -110,26 +110,45 @@ def _read_mcp_url(default_manifest_path: str) -> str:
 # ---------- Robust extractor ----------
 def _extract_mcp_json(result: Any) -> Any:
     """
-    Handles:
-      result.content = [{"type":"application/json","json": <payload>}, {"type":"text","text": "..."}]
-      Pydantic v2 via .model_dump() / .model_dump_json()
-      Generic .json() as string
-    Falls back to 'text' if only a text error was returned by the server.
+    Collect all JSON parts from an MCP ToolResult.
+    - If there's exactly one JSON part: return it directly.
+    - If there are multiple JSON parts: return a list of them.
+    - If there are no JSON parts but there are text parts: return the concatenated text.
+    - Supports pydantic v2 objects via model_dump/model_dump_json too.
     """
     try:
         content = getattr(result, "content", None)
+
+        # If the server already gave us a plain list/dict, just return it.
+        if isinstance(result, (list, dict)) and content is None:
+            return result
+
         if isinstance(content, list):
-            # Prefer JSON parts
+            json_parts = []
+            text_parts = []
+
             for item in content:
-                if isinstance(item, dict) and "json" in item:
-                    return item["json"]
+                # 1) Normal dict payload
+                if isinstance(item, dict):
+                    if "json" in item:
+                        json_parts.append(item["json"])
+                        continue
+                    if "text" in item:
+                        text_parts.append(item["text"])
+                        continue
+
+                # 2) Pydantic v2 objects
                 if hasattr(item, "model_dump"):
-                    return item.model_dump()
+                    json_parts.append(item.model_dump())
+                    continue
                 if hasattr(item, "model_dump_json"):
                     try:
-                        return json.loads(item.model_dump_json())
+                        json_parts.append(json.loads(item.model_dump_json()))
                     except Exception:
-                        return item.model_dump_json()
+                        json_parts.append(item.model_dump_json())
+                    continue
+
+                # 3) Generic .json attribute/method
                 if hasattr(item, "json"):
                     attr = getattr(item, "json")
                     try:
@@ -138,21 +157,32 @@ def _extract_mcp_json(result: Any) -> Any:
                         val = attr
                     if isinstance(val, str):
                         try:
-                            return json.loads(val)
+                            json_parts.append(json.loads(val))
                         except Exception:
-                            return val
-                    return val
-            # Then try text
-            for item in content:
-                if isinstance(item, dict) and "text" in item:
-                    return {"error": True, "message": item["text"]}
+                            text_parts.append(val)
+                    else:
+                        json_parts.append(val)
+                    continue
+
+                # 4) Generic .text
                 if hasattr(item, "text"):
-                    return {"error": True, "message": getattr(item, "text")}
-        if isinstance(result, (dict, list)):
-            return result
+                    text_parts.append(getattr(item, "text"))
+                    continue
+
+            # Prefer JSON when present
+            if len(json_parts) == 1:
+                return json_parts[0]
+            if len(json_parts) > 1:
+                return json_parts
+
+            # Fallback to text (concat)
+            if text_parts:
+                return "\n".join(str(t) for t in text_parts if t is not None)
+
+        # Final fallback
+        return result
     except Exception:
-        pass
-    return result
+        return result
 
 
 # ---------- Singleton Streamable-HTTP session ----------
