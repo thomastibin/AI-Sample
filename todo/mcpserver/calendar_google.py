@@ -89,51 +89,103 @@ def _rfc3339(dt: datetime) -> str:
     return dt.astimezone(pytz.UTC).isoformat()
 
 
-def search_events(date_from: datetime, date_to: datetime, attendees: Optional[List[str]] = None) -> List[CalEventOut]:
+def search_events(
+    date_from: datetime,
+    date_to: datetime,
+    attendees: Optional[List[str]] = None
+) -> List[CalEventOut]:
     dbg(f"[CAL] search_events from={date_from} to={date_to} attendees={attendees}")
     service = get_calendar_service()
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID", "primary")
-    events_result = (
-        service.events()
-        .list(
-            calendarId=calendar_id,
-            timeMin=_rfc3339(date_from),
-            timeMax=_rfc3339(date_to),
-            singleEvents=True,
-            orderBy="startTime",
-        )
-        .execute()
-    )
-    items = events_result.get("items", [])
+    default_tz = os.getenv("DEFAULT_TZ", "Asia/Kolkata")
+    tz = pytz.timezone(default_tz)
+
+    def _parse_dt(edge: Dict[str, Any]) -> datetime:
+        """
+        Google returns either {"dateTime": "..."} or {"date": "YYYY-MM-DD"}.
+        Return timezone-aware UTC datetime for both forms.
+        """
+        if not edge:
+            return datetime.min.replace(tzinfo=pytz.UTC)
+
+        dt_str = edge.get("dateTime")
+        if dt_str:
+            # Normalize 'Z' for fromisoformat()
+            if dt_str.endswith("Z"):
+                dt_str = dt_str.replace("Z", "+00:00")
+            return datetime.fromisoformat(dt_str).astimezone(pytz.UTC)
+
+        d_str = edge.get("date")
+        if d_str:
+            # Interpret all-day as local midnight in DEFAULT_TZ, then to UTC
+            local_midnight = tz.localize(datetime.fromisoformat(d_str))
+            return local_midnight.astimezone(pytz.UTC)
+
+        return datetime.min.replace(tzinfo=pytz.UTC)
 
     results: List[CalEventOut] = []
-    for ev in items:
-        start_dt = ev.get("start", {}).get("dateTime")
-        end_dt = ev.get("end", {}).get("dateTime")
-        emails = [a.get("email") for a in ev.get("attendees", []) if a.get("email")]
-        if attendees:
-            # Filter only events that include any of the attendees
-            if not any(e in emails for e in attendees):
-                continue
-        # Normalize 'Z' to '+00:00' for fromisoformat compatibility
-        if isinstance(start_dt, str) and start_dt.endswith('Z'):
-            start_dt = start_dt.replace('Z', '+00:00')
-        if isinstance(end_dt, str) and end_dt.endswith('Z'):
-            end_dt = end_dt.replace('Z', '+00:00')
-        results.append(
-            CalEventOut(
-                id=ev.get("id"),
-                title=ev.get("summary", ""),
-                start=datetime.fromisoformat(start_dt),
-                end=datetime.fromisoformat(end_dt),
-                attendees=emails,
-                meetLink=ev.get("hangoutLink") or (ev.get("conferenceData", {}) or {}).get("entryPoints", [{}])[0].get("uri"),
+    page_token: Optional[str] = None
+
+    while True:
+        events_result = (
+            service.events()
+            .list(
+                calendarId=calendar_id,
+                timeMin=_rfc3339(date_from),
+                timeMax=_rfc3339(date_to),   # Google treats this as exclusive upper bound
+                singleEvents=True,           # expand recurrences
+                orderBy="startTime",
+                pageToken=page_token,
+                maxResults=250,
             )
+            .execute()
         )
+        items = events_result.get("items", []) or []
+
+        for ev in items:
+            # Collect emails from attendees + organizer + creator
+            emails: List[str] = []
+            emails.extend([a.get("email") for a in ev.get("attendees", []) if a.get("email")])
+            org = (ev.get("organizer") or {}).get("email")
+            if org:
+                emails.append(org)
+            crt = (ev.get("creator") or {}).get("email")
+            if crt:
+                emails.append(crt)
+            # de-dup + normalize
+            emails = sorted({(e or "").strip() for e in emails if e})
+
+            # Apply attendees filter if provided (match any)
+            if attendees:
+                target = {e.lower() for e in attendees if e}
+                if not any((e or "").lower() in target for e in emails):
+                    continue
+
+            start_dt = _parse_dt(ev.get("start"))
+            end_dt = _parse_dt(ev.get("end"))
+
+            # Prefer hangoutLink, else try conferenceData.entryPoints[0].uri
+            conf = ev.get("conferenceData") or {}
+            entry_points = conf.get("entryPoints") or []
+            meet_link = ev.get("hangoutLink") or (entry_points[0].get("uri") if entry_points else None)
+
+            results.append(
+                CalEventOut(
+                    id=ev.get("id"),
+                    title=ev.get("summary", "") or "",
+                    start=start_dt,
+                    end=end_dt,
+                    attendees=emails,
+                    meetLink=meet_link,
+                )
+            )
+
+        page_token = events_result.get("nextPageToken")
+        if not page_token:
+            break
+
+    dbg("[CAL] search_events total_count:", len(results))
     return results
-
-
-
 
 
 def schedule_event(

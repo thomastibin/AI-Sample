@@ -314,7 +314,7 @@ async def chat(body: ChatIn):
         })
         plan = _parse_plan_json(raw)
         plan = _normalize_plan(plan, body.message)
-
+        print(f"[LLM] Raw plan JSON: {plan}")
         intent = plan.get("intent")
         print(f"[LLM] Extracted plan: intent={intent}, title={plan.get('title')}")
         if intent not in {"schedule_meeting", "search_todos", "search_meetings","todo.create"}:
@@ -326,9 +326,14 @@ async def chat(body: ChatIn):
         end_text = plan.get("endText")
 
         start_utc, end_utc, tz_name = parse_human_time_to_utc_window(start_text, DEFAULT_TZ)
+        # if start_text !="":
+        #    start_utc= start_text.isoformat()
+        # if end_text !="":
+        #    end_utc= end_text.isoformat()
         if end_text:
             e2, _, _ = parse_human_time_to_utc_window(end_text, tz_name)
             end_utc = e2
+        print(f"[LLM] Parsed times: start_utc={start_utc.isoformat()}, end_utc={end_utc.isoformat()}, tz={tz_name}")
 
         # PHASE B: execute
         assert _mcp_bus and _mcp_bus.session, "MCP bus not initialized"
@@ -382,6 +387,7 @@ async def chat(body: ChatIn):
                 "dateTo":   end_utc.isoformat(),
                 "attendees": attendees or []
             })
+            print(f"[MCP] search_meetings results: {results}")
             return {"ok": True, "events": results or []}
         elif intent == "todo.create":
             todo_created = await mcp.call("todo.create", {

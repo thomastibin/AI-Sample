@@ -14,6 +14,7 @@ def parse_human_time_to_utc_window(text: str, default_tz: str = "Asia/Kolkata") 
     - Accepts phrases like "next tuesday at 3pm".
     - If end not specified, assume 30 minutes duration.
     - Returns timezone-aware UTC datetimes.
+    -If passed time is like 2025-11-01T00:00:00+05:30, respects that offset and return that.
     """
     s = (text or "").strip()
     settings = {
