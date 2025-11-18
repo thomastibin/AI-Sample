@@ -242,7 +242,7 @@ def find_free_slots(date_from: datetime, date_to: datetime, min_minutes: int = 3
     for e in events:
         busy.append((e.start.astimezone(pytz.UTC), e.end.astimezone(pytz.UTC)))
     busy.sort(key=lambda t: t[0])
-    print(f"[CAL] find_free_slots busy intervals: {busy}")
+
     # Merge busy intervals
     merged = []
     for s, e in busy:
@@ -250,7 +250,7 @@ def find_free_slots(date_from: datetime, date_to: datetime, min_minutes: int = 3
             merged.append([s, e])
         else:
             merged[-1][1] = max(merged[-1][1], e)
-    print(f"[CAL] find_free_slots merged intervals: {merged}")
+
     # Scan for gaps
     cur = date_from.astimezone(pytz.UTC)
     end = date_to.astimezone(pytz.UTC)
@@ -264,10 +264,8 @@ def find_free_slots(date_from: datetime, date_to: datetime, min_minutes: int = 3
 
     # Keep only gaps >= min_minutes, return in ISO
     min_delta = timedelta(minutes=min_minutes)
-    
     out = []
     for g0, g1 in gaps:
         if (g1 - g0) >= min_delta:
             out.append({"start": g0.isoformat(), "end": g1.isoformat()})
-    print(f"[CAL] find_free_slots found {(out)} slots")        
     return out

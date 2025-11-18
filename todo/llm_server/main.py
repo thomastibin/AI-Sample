@@ -22,9 +22,77 @@ import httpx
 
 from .time_utils import parse_human_time_to_utc_window
 
+from googleapiclient.discovery import build
+from base64 import urlsafe_b64decode
+import re
+
+
 load_dotenv()
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Asia/Kolkata")
 
+def _gmail_service_from_calendar_creds():
+    # reuse calendar creds bootstrap by calling your calendar helper URL via HTTP shim
+    # or—if this file can import your calendar module directly—do that instead.
+    from .calendar_google import get_calendar_service
+    cal = get_calendar_service()
+    creds = cal._http.credentials
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+async def _poll_replies_every(app_state, interval_sec=30):
+    svc = _gmail_service_from_calendar_creds()
+    seen_ids = set()
+    while True:
+        try:
+            # Fetch messages containing your correlation token Ref:XXXX
+            q = 'subject:"[Ref:" newer_than:7d'  # quick filter; refine if needed
+            msgs = svc.users().messages().list(userId="me", q=q, maxResults=50).execute().get("messages", [])
+            for m in msgs:
+                if m["id"] in seen_ids: 
+                    continue
+                full = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
+                seen_ids.add(m["id"])
+                # Extract subject + body
+                headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
+                subject = headers.get("subject", "")
+                m = re.search(r"\[Ref:(?P<key>[A-Za-z0-9]+)\]", subject)
+                if not m: 
+                    continue
+                key = m.group("key")
+
+                # Decode simple/plain body part if present
+                body = ""
+                parts = full.get("payload", {}).get("parts", []) or []
+                for p in parts:
+                    if p.get("mimeType") == "text/plain" and "data" in p.get("body", {}):
+                        body = urlsafe_b64decode(p["body"]["data"]).decode("utf-8", errors="ignore")
+                        break
+
+                # Store per-threadKey in memory (or Mongo) for aggregation
+                app_state.setdefault("replies", {}).setdefault(key, []).append({
+                    "from": headers.get("from"), "body": body, "id": full.get("id"),
+                })
+
+                # Heuristic: if all invitees replied -> finalize
+                thread_info = app_state.get("threadMeta", {}).get(key)
+                if thread_info:
+                    invited = set(map(str.lower, thread_info.get("attendees", [])))
+                    responders = set()
+                    for r in app_state["replies"][key]:
+                        frm = (r["from"] or "").lower()
+                        # extract email inside <>
+                        m2 = re.search(r"<([^>]+)>", frm)
+                        if m2:
+                            responders.add(m2.group(1))
+                        else:
+                            responders.add(frm)
+                    if invited.issubset(responders):
+                        # parse replies with LLM to pick a time window (not shown),
+                        # then call MCP to schedule & todo.create
+                        # await mcp.call("calendar.schedule", {...})
+                        pass
+        except Exception:
+            pass
+        await asyncio.sleep(interval_sec)
 
 # ---------- LLM (planner) ----------
 def _new_llm() -> ChatGoogleGenerativeAI:
@@ -108,82 +176,79 @@ def _read_mcp_url(default_manifest_path: str) -> str:
 
 
 # ---------- Robust extractor ----------
+# --- DROP-IN REPLACEMENT in llm_server/main.py ---
+
 def _extract_mcp_json(result: Any) -> Any:
     """
-    Collect all JSON parts from an MCP ToolResult.
-    - If there's exactly one JSON part: return it directly.
-    - If there are multiple JSON parts: return a list of them.
-    - If there are no JSON parts but there are text parts: return the concatenated text.
-    - Supports pydantic v2 objects via model_dump/model_dump_json too.
+    Normalize MCP tool responses so the rest of the code always sees:
+        {"type": "json", "data": <parsed python object>}
+    Works even if the server returned a text content with JSON string.
     """
+    def _maybe_json_text(txt: str) -> Any:
+        s = (txt or "").strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return json.loads(s)
+            except Exception:
+                return txt
+        return txt
+
+    def _envelope(obj: Any) -> Dict[str, Any]:
+        # If it's already our envelope, keep it
+        if isinstance(obj, dict) and obj.get("type") in ("json", "application/json") and "data" in obj:
+            return {"type": "json", "data": obj["data"]}
+        # Otherwise wrap whatever we parsed as data
+        return {"type": "json", "data": obj}
+
     try:
         content = getattr(result, "content", None)
-
-        # If the server already gave us a plain list/dict, just return it.
-        if isinstance(result, (list, dict)) and content is None:
-            return result
-
-        if isinstance(content, list):
-            json_parts = []
-            text_parts = []
-
+        if isinstance(content, list) and content:
+            # 1) Prefer explicit JSON parts
             for item in content:
-                # 1) Normal dict payload
-                if isinstance(item, dict):
-                    if "json" in item:
-                        json_parts.append(item["json"])
-                        continue
-                    if "text" in item:
-                        text_parts.append(item["text"])
-                        continue
+                if isinstance(item, dict) and item.get("type") == "application/json" and "json" in item:
+                    return _envelope(item["json"])
 
-                # 2) Pydantic v2 objects
+            # 2) Pydantic-ish objects
+            for item in content:
                 if hasattr(item, "model_dump"):
-                    json_parts.append(item.model_dump())
-                    continue
+                    return _envelope(item.model_dump())
                 if hasattr(item, "model_dump_json"):
                     try:
-                        json_parts.append(json.loads(item.model_dump_json()))
+                        return _envelope(json.loads(item.model_dump_json()))
                     except Exception:
-                        json_parts.append(item.model_dump_json())
-                    continue
-
-                # 3) Generic .json attribute/method
+                        pass
                 if hasattr(item, "json"):
-                    attr = getattr(item, "json")
                     try:
-                        val = attr() if callable(attr) else attr
+                        val = item.json() if callable(item.json) else item.json
                     except Exception:
-                        val = attr
+                        val = item
                     if isinstance(val, str):
-                        try:
-                            json_parts.append(json.loads(val))
-                        except Exception:
-                            text_parts.append(val)
-                    else:
-                        json_parts.append(val)
-                    continue
+                        return _envelope(_maybe_json_text(val))
+                    return _envelope(val)
 
-                # 4) Generic .text
+            # 3) Text fallback (common on older fastmcp)
+            for item in content:
+                if isinstance(item, dict) and "text" in item:
+                    return _envelope(_maybe_json_text(item["text"]))
                 if hasattr(item, "text"):
-                    text_parts.append(getattr(item, "text"))
-                    continue
+                    return _envelope(_maybe_json_text(getattr(item, "text")))
 
-            # Prefer JSON when present
-            if len(json_parts) == 1:
-                return json_parts[0]
-            if len(json_parts) > 1:
-                return json_parts
-
-            # Fallback to text (concat)
-            if text_parts:
-                return "\n".join(str(t) for t in text_parts if t is not None)
-
-        # Final fallback
-        return result
+        # 4) Already a dict/list
+        if isinstance(result, (dict, list)):
+            return _envelope(result)
     except Exception:
-        return result
+        pass
+    # Unknown shape – still envelope it so callers are consistent
+    return {"type": "json", "data": result}
 
+
+def mcp_data(payload: Any) -> Any:
+    """
+    Convenience: call this on the result of mcp.call(...) to directly get the 'data' object.
+    """
+    if isinstance(payload, dict) and payload.get("type") in ("json", "application/json"):
+        return payload.get("data")
+    return payload
 
 # ---------- Singleton Streamable-HTTP session ----------
 class MCPBus:
@@ -280,18 +345,44 @@ app.add_middleware(
 
 _mcp_bus: Optional[MCPBus] = None
 
+@app.get("/_debug/replies")
+async def debug_replies():
+    return app.state.meet_state
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _mcp_bus
     _mcp_bus = MCPBus(os.path.join(os.path.dirname(__file__), "mcp_manifest.json"))
     await _mcp_bus.start()
+
+    # ✅ init shared state used by the poller
+    app.state.meet_state = {
+        "threadMeta": {},   # key -> { "attendees": [...] , ... }
+        "replies": {}       # key -> [ { from, body, id }, ... ]
+    }
+
+    # ✅ start Gmail poller (checks every 30s; adjust if needed)
+    app.state.gmail_poller = asyncio.create_task(
+        _poll_replies_every(app.state.meet_state, interval_sec=30)
+    )
+
     try:
         yield
     finally:
+        # ✅ stop poller cleanly
+        poller = getattr(app.state, "gmail_poller", None)
+        if poller:
+            poller.cancel()
+            try:
+                await poller
+            except asyncio.CancelledError:
+                pass
+
         if _mcp_bus:
             await _mcp_bus.stop()
             _mcp_bus = None
 
+# keep this line:
 app.router.lifespan_context = lifespan  # <-- ONLY lifespan; remove on_event handlers
 
 
@@ -302,6 +393,7 @@ class ChatIn(BaseModel):
 @app.post("/chat")
 async def chat(body: ChatIn):
     try:
+        print(f"[LLM] chat API started: {body.message[:50]!r}...")
         # PHASE A: plan
         prompt, schema_desc = _intent_chain()
         chain = prompt | _new_llm() | StrOutputParser()
@@ -370,57 +462,78 @@ async def chat(body: ChatIn):
         mcp = _mcp_bus
 
         if intent == "schedule_meeting":
-            pad = timedelta(minutes=30)
-            cal_events = await mcp.call("calendar.search", {
-                "dateFrom": (start_utc - pad).isoformat(),
-                "dateTo":   (end_utc + pad).isoformat(),
-                "attendees": attendees
-            })
-            if isinstance(cal_events, list) and len(cal_events) > 0:
-                local_zone = pytz.timezone(tz_name)
-                start_local = start_utc.astimezone(local_zone)
-                alts = []
-                for mins in (30, 60):
-                    t = (start_local + timedelta(minutes=mins)).astimezone(local_zone)
-                    alts.append(t.strftime("%I:%M %p %Z").lstrip("0"))
-                return {"conflict": True, "events": cal_events, "suggestions": alts}
+            day_start_utc = start_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end_utc   = end_utc.replace(hour=23, minute=59, second=59, microsecond=0)
 
-            cal_created = await mcp.call("calendar.schedule", {
-                "title": title,
-                "start": start_utc.astimezone(pytz.timezone(tz_name)).isoformat(),
-                "end":   end_utc.astimezone(pytz.timezone(tz_name)).isoformat(),
-                "attendees": attendees,
-                "description": plan.get("description") or "",
-                "tz": tz_name,
+            slots_env = await mcp.call("calendar.free", {
+                "dateFrom": day_start_utc.isoformat(),
+                "dateTo":   day_end_utc.isoformat(),
+                "minMinutes": 30
             })
-            todo_created = await mcp.call("todo.create", {
-                "title": title,
-                "start": start_utc.isoformat(),
-                "end":   end_utc.isoformat(),
-                "attendees": attendees,
-                "description": plan.get("description") or "",
-                "tz": tz_name,
+            slots = mcp_data(slots_env)
+            print(f"[LLM] Found free slots: {slots}")
+            if not isinstance(slots, list) or not slots:
+                return {"ok": True, "message": "No free 30-min slots found on that day."}
+
+            # 2) Build a plain-text email listing the free slots in IST for readability
+            ist = pytz.timezone(tz_name)
+            lines = []
+            for s in slots:
+                sdt = datetime.fromisoformat(s["start"]).astimezone(ist)
+                edt = datetime.fromisoformat(s["end"]).astimezone(ist)
+                # suggest the first 30 minutes within each gap
+                lines.append(f"- {sdt.strftime('%d %b %Y %I:%M %p')} to {(sdt + timedelta(minutes=30)).strftime('%I:%M %p')} IST")
+
+            thread_key = uuid.uuid4().hex[:8]
+            subject = f"Proposed meeting times on {start_utc.astimezone(ist).strftime('%d %b %Y')}"
+            body = (
+                "Hi,\n\n"
+                "I’m planning a Google Meet on the date above. Here are my free 30-minute windows—"
+                "please reply with the option(s) you prefer (or another time on the same day):\n\n"
+                + "\n".join(lines) +
+                "\n\nThanks!"
+            )
+
+            email_res_env = await mcp.call("gmail.sendProposal", {
+                "to": attendees,
+                "subject": subject,
+                "body": body,
+                "threadKey": thread_key
             })
-            return {"ok": True, "event": cal_created or {}, "todo": todo_created or {}}
+            email_res = mcp_data(email_res_env)
+            # Correlate replies to this outbound proposal
+            app.state.meet_state["threadMeta"][thread_key] = {
+                "attendees": attendees,
+                "title": title
+            }
+
+            return {
+                "ok": True,
+                "sent": email_res,
+                "threadKey": thread_key,
+                "proposedSlots": slots
+            }
 
         elif intent == "search_todos":
-            results = await mcp.call("todo.search", {
+            results_env = await mcp.call("todo.search", {
                 "dateFrom": start_utc.isoformat(),
                 "dateTo":   end_utc.isoformat(),
                 "text": None
             })
+            results = mcp_data(results_env)
             return {"ok": True, "todos": results or []}
 
         elif intent == "search_meetings":
-            results = await mcp.call("calendar.search", {
+            results_env = await mcp.call("calendar.search", {
                 "dateFrom": start_utc.isoformat(),
                 "dateTo":   end_utc.isoformat(),
                 "attendees": attendees or []
             })
+            results = mcp_data(results_env)
             print(f"[MCP] search_meetings results: {results}")
             return {"ok": True, "events": results or []}
         elif intent == "todo.create":
-            todo_created = await mcp.call("todo.create", {
+            todo_created_env = await mcp.call("todo.create", {
                 "title": title,
                 "start": start_utc.isoformat(),
                 "end":   end_utc.isoformat(),
@@ -428,6 +541,7 @@ async def chat(body: ChatIn):
                 "description": plan.get("description") or "",
                 "tz": tz_name,
             })
+            todo_created = mcp_data(todo_created_env)
             return {"ok": True,   "todo": todo_created or {}}
 
         return {"error": True, "message": "Unknown state"}

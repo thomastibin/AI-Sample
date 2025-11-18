@@ -16,3 +16,6 @@ mcp>=1.1
 httpx>=0.27
 python-dotenv>=1.0
 anyio>=4.4
+click
+starlette
+langchain-core
